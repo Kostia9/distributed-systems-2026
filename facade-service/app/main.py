@@ -2,7 +2,6 @@ import asyncio
 import os
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from time import perf_counter
 from typing import Any, Dict, List
 
@@ -67,27 +66,19 @@ async def _timed(name: str, coro):
         _TIMINGS[name].add(dt)
 
 
-def _utc_now() -> datetime:
-    return datetime.now(tz=timezone.utc)
-
-
 async def _client() -> httpx.AsyncClient:
-    # A small wrapper so we can tweak defaults centrally.
     return httpx.AsyncClient(timeout=httpx.Timeout(HTTP_TIMEOUT_S))
 
 
 @app.post("/transaction", response_model=FacadePostResponse)
 async def post_transaction(req: ClientTransactionIn) -> FacadePostResponse:
-    # Spec allows timestamp as unique ID; we use UUID (still include timestamp).
     tx = {
         "transaction_id": str(uuid.uuid4()),
         "user_id": req.user_id,
         "amount": req.amount,
-        "timestamp": _utc_now().isoformat(),
     }
 
     async with await _client() as client:
-        # Send to both services concurrently; wait for both.
         try:
             log_resp, counter_resp = await asyncio.gather(
                 _timed("logging", client.post(f"{LOGGING_URL}/transactions", json=tx)),
