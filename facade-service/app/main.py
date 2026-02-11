@@ -1,22 +1,45 @@
 import asyncio
 import os
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from time import perf_counter
 from typing import Any, Dict, List
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Depends
 from pydantic import BaseModel, Field
 
-
+# --- Constants ---
 LOGGING_URL = os.getenv("LOGGING_URL", "http://localhost:8001").rstrip("/")
 COUNTER_URL = os.getenv("COUNTER_URL", "http://localhost:8002").rstrip("/")
 HTTP_TIMEOUT_S = float(os.getenv("HTTP_TIMEOUT_S", "5"))
 
-app = FastAPI(title="facade-service")
+
+# --- Lifespan ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    limits = httpx.Limits(
+        max_connections=100,
+        max_keepalive_connections=20,
+        keepalive_expiry=30.0,
+    )
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(HTTP_TIMEOUT_S),
+        limits=limits,
+    ) as client:
+        app.state.http_client = client
+        yield
 
 
+app = FastAPI(title="facade-service", lifespan=lifespan)
+
+
+def get_client(request: Request) -> httpx.AsyncClient:
+    return request.app.state.http_client
+
+
+# --- Request models ---
 class ClientTransactionIn(BaseModel):
     user_id: str = Field(..., min_length=1)
     amount: int
@@ -37,6 +60,7 @@ class AccountsResponse(BaseModel):
     balances: Dict[str, int]
 
 
+# --- Metrics ---
 @dataclass
 class Timing:
     total_s: float = 0.0
@@ -58,6 +82,7 @@ _TIMINGS: Dict[str, Timing] = {
 
 
 async def _timed(name: str, coro):
+    """Measure and record timing for a coroutine."""
     t0 = perf_counter()
     try:
         return await coro
@@ -66,35 +91,32 @@ async def _timed(name: str, coro):
         _TIMINGS[name].add(dt)
 
 
-async def _client() -> httpx.AsyncClient:
-    return httpx.AsyncClient(timeout=httpx.Timeout(HTTP_TIMEOUT_S))
-
-
+# --- Endpoints ---
 @app.post("/transaction", response_model=FacadePostResponse)
-async def post_transaction(req: ClientTransactionIn) -> FacadePostResponse:
+async def post_transaction(
+    req: ClientTransactionIn, client: httpx.AsyncClient = Depends(get_client)
+) -> FacadePostResponse:
     tx = {
         "transaction_id": str(uuid.uuid4()),
         "user_id": req.user_id,
         "amount": req.amount,
     }
 
-    async with await _client() as client:
-        try:
-            log_resp, counter_resp = await asyncio.gather(
-                _timed("logging", client.post(f"{LOGGING_URL}/transactions", json=tx)),
-                _timed(
-                    "counter",
-                    client.post(
-                        f"{COUNTER_URL}/apply",
-                        json={"user_id": req.user_id, "amount": req.amount},
-                    ),
+    try:
+        log_resp, counter_resp = await asyncio.gather(
+            _timed("logging", client.post(f"{LOGGING_URL}/transactions", json=tx)),
+            _timed(
+                "counter",
+                client.post(
+                    f"{COUNTER_URL}/apply",
+                    json={"user_id": req.user_id, "amount": req.amount},
                 ),
-            )
-        except httpx.RequestError as e:
-            raise HTTPException(
-                status_code=503, detail=f"downstream unavailable: {e!s}"
-            )
+            ),
+        )
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=503, detail=f"downstream unavailable: {e!s}")
 
+    # error handling
     if log_resp.status_code >= 400:
         raise HTTPException(
             status_code=502, detail=f"logging-service error: {log_resp.text}"
@@ -104,51 +126,44 @@ async def post_transaction(req: ClientTransactionIn) -> FacadePostResponse:
             status_code=502, detail=f"counter-service error: {counter_resp.text}"
         )
 
-    data = counter_resp.json()
     return FacadePostResponse(
-        transaction_id=tx["transaction_id"], balance=int(data["balance"])
+        transaction_id=tx["transaction_id"], balance=int(counter_resp.json()["balance"])
     )
 
 
 @app.get("/user/{user_id}", response_model=UserViewResponse)
-async def get_user_view(user_id: str) -> UserViewResponse:
-    async with await _client() as client:
-        try:
-            bal_resp, txs_resp = await asyncio.gather(
-                _timed("counter", client.get(f"{COUNTER_URL}/balance/{user_id}")),
-                _timed(
-                    "logging", client.get(f"{LOGGING_URL}/transactions/user/{user_id}")
-                ),
-            )
-        except httpx.RequestError as e:
-            raise HTTPException(
-                status_code=503, detail=f"downstream unavailable: {e!s}"
-            )
-
-    if bal_resp.status_code >= 400:
-        raise HTTPException(
-            status_code=502, detail=f"counter-service error: {bal_resp.text}"
+async def get_user_view(
+    user_id: str, client: httpx.AsyncClient = Depends(get_client)
+) -> UserViewResponse:
+    try:
+        bal_resp, txs_resp = await asyncio.gather(
+            _timed("counter", client.get(f"{COUNTER_URL}/balance/{user_id}")),
+            _timed("logging", client.get(f"{LOGGING_URL}/transactions/user/{user_id}")),
         )
-    if txs_resp.status_code >= 400:
-        raise HTTPException(
-            status_code=502, detail=f"logging-service error: {txs_resp.text}"
-        )
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=503, detail=f"downstream unavailable: {e!s}")
 
-    balance = int(bal_resp.json()["balance"])
-    txs = txs_resp.json().get("transactions", [])
-    return UserViewResponse(user_id=user_id, balance=balance, transactions=txs)
+    # error handling
+    if bal_resp.status_code >= 400 or txs_resp.status_code >= 400:
+        raise HTTPException(status_code=502, detail="Downstream service error")
+
+    return UserViewResponse(
+        user_id=user_id,
+        balance=int(bal_resp.json()["balance"]),
+        transactions=txs_resp.json().get("transactions", []),
+    )
 
 
 @app.get("/accounts", response_model=AccountsResponse)
-async def get_accounts() -> AccountsResponse:
-    async with await _client() as client:
-        try:
-            resp = await _timed("counter", client.get(f"{COUNTER_URL}/balances"))
-        except httpx.RequestError as e:
-            raise HTTPException(
-                status_code=503, detail=f"downstream unavailable: {e!s}"
-            )
+async def get_accounts(
+    client: httpx.AsyncClient = Depends(get_client),
+) -> AccountsResponse:
+    try:
+        resp = await _timed("counter", client.get(f"{COUNTER_URL}/balances"))
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=503, detail=f"downstream unavailable: {e!s}")
 
+    # error handling
     if resp.status_code >= 400:
         raise HTTPException(
             status_code=502, detail=f"counter-service error: {resp.text}"
