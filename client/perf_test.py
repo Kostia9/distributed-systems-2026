@@ -12,7 +12,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--scenario", choices=["1", "2"], default="1")
     p.add_argument("--clients", type=int, default=10)
     p.add_argument("--n", type=int, default=10_000, help="requests per client")
-    p.add_argument("--amount", type=int, default=1)
     return p.parse_args()
 
 
@@ -29,27 +28,31 @@ async def worker(
 async def main() -> None:
     args = parse_args()
     base_url = args.base_url.rstrip("/")
+    amount = 1  # money per transaction
 
     users: List[str]
     if args.scenario == "1":
         users = [f"user{i}" for i in range(args.clients)]
-    else:
+    elif args.scenario == "2":
         users = ["shared_user"] * args.clients
+    else:
+        raise ValueError(f"Unknown scenario: {args.scenario}")
 
     limits = httpx.Limits(max_connections=200, max_keepalive_connections=50)
     timeout = httpx.Timeout(30.0)
 
     async with httpx.AsyncClient(limits=limits, timeout=timeout) as client:
-        # optional: reset timings
-        try:
-            await client.post(f"{base_url}/metrics/reset")
-        except Exception:
-            pass
+        # reset timings
+        await client.post(f"{base_url}/metrics/reset")
+
+        # snapshot balances before the test
+        before = (await client.get(f"{base_url}/accounts")).json()
+        balances_before = before.get("balances", {})
 
         t0 = perf_counter()
         await asyncio.gather(
             *[
-                worker(client, base_url, users[i], args.n, args.amount)
+                worker(client, base_url, users[i], args.n, amount)
                 for i in range(args.clients)
             ]
         )
@@ -67,20 +70,32 @@ async def main() -> None:
         print("metrics:", metrics)
 
         accounts = (await client.get(f"{base_url}/accounts")).json()
+        balances_after = accounts.get("balances", {})
         print("accounts:", accounts)
 
-        # sanity check expected balances for the assignment's default parameters
-        if args.amount == 1 and args.clients == 10 and args.n == 10_000:
-            if args.scenario == "1":
-                ok = all(
-                    accounts["balances"].get(f"user{i}", 0) == 10_000 for i in range(10)
-                )
-                print("expected: each user balance == 10000 |", "OK" if ok else "FAIL")
-            else:
-                ok = accounts["balances"].get("shared_user", 0) == 100_000
-                print(
-                    "expected: shared_user balance == 100000 |", "OK" if ok else "FAIL"
-                )
+        # verify relative increase (delta), not absolute values
+        expected_delta = args.n * amount
+        if args.scenario == "1":
+            ok = all(
+                balances_after.get(f"user{i}", 0) - balances_before.get(f"user{i}", 0)
+                == expected_delta
+                for i in range(args.clients)
+            )
+            print(
+                f"expected: each user delta == +{expected_delta} |",
+                "OK" if ok else "FAIL",
+            )
+        else:
+            expected_total_delta = args.clients * args.n * amount
+            actual_delta = balances_after.get("shared_user", 0) - balances_before.get(
+                "shared_user", 0
+            )
+            ok = actual_delta == expected_total_delta
+            print(
+                f"expected: shared_user delta == +{expected_total_delta} |",
+                f"actual delta={actual_delta} |",
+                "OK" if ok else "FAIL",
+            )
 
 
 if __name__ == "__main__":
