@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 
 app = FastAPI(title="logging-service")
 
+# in-memory storage
 _STORE: Dict[str, "Transaction"] = {}
 
 

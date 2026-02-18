@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 
 app = FastAPI(title="counter-service")
 
+# in-memory storage
 _BALANCES: Dict[str, int] = {}
 
 

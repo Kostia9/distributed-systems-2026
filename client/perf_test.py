@@ -73,7 +73,6 @@ async def main() -> None:
         balances_after = accounts.get("balances", {})
         print("accounts:", accounts)
 
-        # verify relative increase (delta), not absolute values
         expected_delta = args.n * amount
         if args.scenario == "1":
             ok = all(

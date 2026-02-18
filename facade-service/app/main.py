@@ -101,17 +101,14 @@ async def post_transaction(
         "user_id": req.user_id,
         "amount": req.amount,
     }
-
+    log_request = client.post(f"{LOGGING_URL}/transactions", json=tx)
+    counter_request = client.post(
+        f"{COUNTER_URL}/apply", json={"user_id": req.user_id, "amount": req.amount}
+    )
     try:
         log_resp, counter_resp = await asyncio.gather(
-            _timed("logging", client.post(f"{LOGGING_URL}/transactions", json=tx)),
-            _timed(
-                "counter",
-                client.post(
-                    f"{COUNTER_URL}/apply",
-                    json={"user_id": req.user_id, "amount": req.amount},
-                ),
-            ),
+            _timed("logging", log_request),
+            _timed("counter", counter_request),
         )
     except httpx.RequestError as e:
         raise HTTPException(status_code=503, detail=f"downstream unavailable: {e!s}")
