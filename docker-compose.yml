@@ -1,4 +1,20 @@
 services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: counter
+      POSTGRES_PASSWORD: counter
+      POSTGRES_DB: counter
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U counter"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
   logging-service:
     build: ./logging-service
     ports:
@@ -8,6 +24,11 @@ services:
     build: ./counter-service
     ports:
       - "8002:8002"
+    environment:
+      DATABASE_URL: "postgresql://counter:counter@postgres:5432/counter"
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   facade-service:
     build: ./facade-service
@@ -20,3 +41,6 @@ services:
     depends_on:
       - logging-service
       - counter-service
+
+volumes:
+  pgdata:

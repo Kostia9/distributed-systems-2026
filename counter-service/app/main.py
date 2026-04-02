@@ -1,13 +1,35 @@
+import os
+from contextlib import asynccontextmanager
 from typing import Dict
 
+import asyncpg
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://counter:counter@localhost:5432/counter",
+)
 
-app = FastAPI(title="counter-service")
 
-# in-memory storage
-_BALANCES: Dict[str, int] = {}
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    pool = await asyncpg.create_pool(DATABASE_URL)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS balances (
+                user_id  VARCHAR(255) PRIMARY KEY,
+                balance  BIGINT NOT NULL DEFAULT 0
+            )
+            """
+        )
+    app.state.db = pool
+    yield
+    await pool.close()
+
+
+app = FastAPI(title="counter-service", lifespan=lifespan)
 
 
 class ApplyRequest(BaseModel):
@@ -26,18 +48,32 @@ class BalancesResponse(BaseModel):
 
 @app.post("/apply", response_model=BalanceResponse)
 async def apply_transaction(req: ApplyRequest) -> BalanceResponse:
-    _BALANCES[req.user_id] = _BALANCES.get(req.user_id, 0) + req.amount
-    bal = _BALANCES[req.user_id]
-    return BalanceResponse(user_id=req.user_id, balance=bal)
+    async with app.state.db.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO balances (user_id, balance)
+            VALUES ($1, $2)
+            ON CONFLICT (user_id)
+            DO UPDATE SET balance = balances.balance + EXCLUDED.balance
+            RETURNING user_id, balance
+            """,
+            req.user_id,
+            req.amount,
+        )
+    return BalanceResponse(user_id=row["user_id"], balance=row["balance"])
 
 
 @app.get("/balance/{user_id}", response_model=BalanceResponse)
 async def get_balance(user_id: str) -> BalanceResponse:
-    bal = _BALANCES.get(user_id, 0)
-    return BalanceResponse(user_id=user_id, balance=bal)
+    async with app.state.db.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT balance FROM balances WHERE user_id = $1", user_id
+        )
+    return BalanceResponse(user_id=user_id, balance=row["balance"] if row else 0)
 
 
 @app.get("/balances", response_model=BalancesResponse)
 async def get_all_balances() -> BalancesResponse:
-    snapshot = dict(_BALANCES)
-    return BalancesResponse(balances=snapshot)
+    async with app.state.db.acquire() as conn:
+        rows = await conn.fetch("SELECT user_id, balance FROM balances")
+    return BalancesResponse(balances={r["user_id"]: r["balance"] for r in rows})
