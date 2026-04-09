@@ -77,3 +77,10 @@ async def get_all_balances() -> BalancesResponse:
     async with app.state.db.acquire() as conn:
         rows = await conn.fetch("SELECT user_id, balance FROM balances")
     return BalancesResponse(balances={r["user_id"]: r["balance"] for r in rows})
+
+
+@app.post("/reset")
+async def reset() -> Dict[str, bool]:
+    async with app.state.db.acquire() as conn:
+        await conn.execute("TRUNCATE balances")
+    return {"ok": True}

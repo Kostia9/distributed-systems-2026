@@ -1,4 +1,41 @@
 services:
+  # --- Hazelcast cluster (3 nodes) ---
+  hz1:
+    image: hazelcast/hazelcast:5.4
+    volumes:
+      - ./hazelcast/hazelcast.yaml:/opt/hazelcast/config/hazelcast.yaml
+    ports:
+      - "5701:5701"
+
+  hz2:
+    image: hazelcast/hazelcast:5.4
+    volumes:
+      - ./hazelcast/hazelcast.yaml:/opt/hazelcast/config/hazelcast.yaml
+    ports:
+      - "5702:5701"
+
+  hz3:
+    image: hazelcast/hazelcast:5.4
+    volumes:
+      - ./hazelcast/hazelcast.yaml:/opt/hazelcast/config/hazelcast.yaml
+    ports:
+      - "5703:5701"
+
+  # --- Hazelcast Management Center ---
+  management-center:
+    image: hazelcast/management-center:5.4.1
+    hostname: management-center
+    ports:
+      - "8080:8080"
+    environment:
+      MC_DEFAULT_CLUSTER: dev
+      MC_DEFAULT_CLUSTER_MEMBERS: "hz1:5701,hz2:5701,hz3:5701"
+    depends_on:
+      - hz1
+      - hz2
+      - hz3
+
+  # --- PostgreSQL ---
   postgres:
     image: postgres:17
     environment:
@@ -15,11 +52,35 @@ services:
       timeout: 3s
       retries: 10
 
-  logging-service:
+  # --- Logging service (3 instances) ---
+  logging-service-1:
     build: ./logging-service
-    ports:
-      - "8001:8001"
+    environment:
+      HZ_ADDRESSES: "hz1:5701,hz2:5701,hz3:5701"
+    depends_on:
+      - hz1
+      - hz2
+      - hz3
 
+  logging-service-2:
+    build: ./logging-service
+    environment:
+      HZ_ADDRESSES: "hz1:5701,hz2:5701,hz3:5701"
+    depends_on:
+      - hz1
+      - hz2
+      - hz3
+
+  logging-service-3:
+    build: ./logging-service
+    environment:
+      HZ_ADDRESSES: "hz1:5701,hz2:5701,hz3:5701"
+    depends_on:
+      - hz1
+      - hz2
+      - hz3
+
+  # --- Counter service ---
   counter-service:
     build: ./counter-service
     ports:
@@ -30,16 +91,19 @@ services:
       postgres:
         condition: service_healthy
 
+  # --- Facade service ---
   facade-service:
     build: ./facade-service
     ports:
       - "8000:8000"
     environment:
-      LOGGING_URL: "http://logging-service:8001"
+      LOGGING_URLS: "http://logging-service-1:8001,http://logging-service-2:8001,http://logging-service-3:8001"
       COUNTER_URL: "http://counter-service:8002"
       HTTP_TIMEOUT_S: "5"
     depends_on:
-      - logging-service
+      - logging-service-1
+      - logging-service-2
+      - logging-service-3
       - counter-service
 
 volumes:
