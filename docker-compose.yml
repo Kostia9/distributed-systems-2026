@@ -1,4 +1,9 @@
 services:
+  config-server:
+    build: ./config-server
+    ports:
+      - "8003:8003"
+
   # --- Hazelcast cluster (3 nodes) ---
   hz1:
     image: hazelcast/hazelcast:5.4
@@ -56,8 +61,11 @@ services:
   logging-service-1:
     build: ./logging-service
     environment:
+      CONFIG_SERVER_URL: "http://config-server:8003"
+      SERVICE_URL: "http://logging-service-1:8001"
       HZ_ADDRESSES: "hz1:5701,hz2:5701,hz3:5701"
     depends_on:
+      - config-server
       - hz1
       - hz2
       - hz3
@@ -65,8 +73,11 @@ services:
   logging-service-2:
     build: ./logging-service
     environment:
+      CONFIG_SERVER_URL: "http://config-server:8003"
+      SERVICE_URL: "http://logging-service-2:8001"
       HZ_ADDRESSES: "hz1:5701,hz2:5701,hz3:5701"
     depends_on:
+      - config-server
       - hz1
       - hz2
       - hz3
@@ -74,8 +85,11 @@ services:
   logging-service-3:
     build: ./logging-service
     environment:
+      CONFIG_SERVER_URL: "http://config-server:8003"
+      SERVICE_URL: "http://logging-service-3:8001"
       HZ_ADDRESSES: "hz1:5701,hz2:5701,hz3:5701"
     depends_on:
+      - config-server
       - hz1
       - hz2
       - hz3
@@ -86,8 +100,19 @@ services:
     ports:
       - "8002:8002"
     environment:
+      CONFIG_SERVER_URL: "http://config-server:8003"
+      SERVICE_URL: "http://counter-service:8002"
       DATABASE_URL: "postgresql://counter:counter@postgres:5432/counter"
+      HZ_ADDRESSES: "hz1:5701,hz2:5701,hz3:5701"
     depends_on:
+      config-server:
+        condition: service_started
+      hz1:
+        condition: service_started
+      hz2:
+        condition: service_started
+      hz3:
+        condition: service_started
       postgres:
         condition: service_healthy
 
@@ -97,10 +122,15 @@ services:
     ports:
       - "8000:8000"
     environment:
-      LOGGING_URLS: "http://logging-service-1:8001,http://logging-service-2:8001,http://logging-service-3:8001"
-      COUNTER_URL: "http://counter-service:8002"
+      CONFIG_SERVER_URL: "http://config-server:8003"
+      SERVICE_URL: "http://facade-service:8000"
+      HZ_ADDRESSES: "hz1:5701,hz2:5701,hz3:5701"
       HTTP_TIMEOUT_S: "5"
     depends_on:
+      - config-server
+      - hz1
+      - hz2
+      - hz3
       - logging-service-1
       - logging-service-2
       - logging-service-3

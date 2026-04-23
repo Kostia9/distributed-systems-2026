@@ -1,4 +1,6 @@
 import asyncio
+import json
+import logging
 import os
 import random
 import uuid
@@ -7,21 +9,34 @@ from dataclasses import dataclass
 from time import perf_counter
 from typing import Any, Dict, List
 
+import hazelcast
 import httpx
-from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi import Depends, FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
-# --- Constants ---
-LOGGING_URLS: List[str] = [
-    u.rstrip("/")
-    for u in os.getenv("LOGGING_URLS", "http://localhost:8001").split(",")
-    if u.strip()
-]
-COUNTER_URL = os.getenv("COUNTER_URL", "http://localhost:8002").rstrip("/")
+SERVICE_NAME = "facade-service"
+CONFIG_SERVER_URL = os.getenv("CONFIG_SERVER_URL", "http://localhost:8003").rstrip("/")
+SERVICE_URL = os.getenv("SERVICE_URL", "http://localhost:8000").rstrip("/")
+HZ_ADDRESSES: List[str] = [addr.strip() for addr in os.getenv("HZ_ADDRESSES", "localhost:5701").split(",") if addr.strip()]
+QUEUE_NAME = os.getenv("COUNTER_QUEUE_NAME", "counter-transactions")
 HTTP_TIMEOUT_S = float(os.getenv("HTTP_TIMEOUT_S", "5"))
 
+logger = logging.getLogger("facade-service")
 
-# --- Lifespan ---
+
+async def _register_service(client: httpx.AsyncClient) -> None:
+    payload = {"service_name": SERVICE_NAME, "url": SERVICE_URL}
+    while True:
+        try:
+            resp = await client.post(f"{CONFIG_SERVER_URL}/register", json=payload)
+            resp.raise_for_status()
+            logger.info("Registered %s at %s", SERVICE_NAME, SERVICE_URL)
+            return
+        except httpx.HTTPError as exc:
+            logger.warning("config-server unavailable, retrying registration: %s", exc)
+            await asyncio.sleep(1)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     limits = httpx.Limits(
@@ -29,12 +44,21 @@ async def lifespan(app: FastAPI):
         max_keepalive_connections=20,
         keepalive_expiry=30.0,
     )
+    hz_client = hazelcast.HazelcastClient(
+        cluster_members=HZ_ADDRESSES,
+        cluster_name="dev",
+    )
+    counter_queue = hz_client.get_queue(QUEUE_NAME).blocking()
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(HTTP_TIMEOUT_S),
         limits=limits,
     ) as client:
         app.state.http_client = client
+        app.state.hz_client = hz_client
+        app.state.counter_queue = counter_queue
+        await _register_service(client)
         yield
+    hz_client.shutdown()
 
 
 app = FastAPI(title="facade-service", lifespan=lifespan)
@@ -52,17 +76,17 @@ class ClientTransactionIn(BaseModel):
 
 class FacadePostResponse(BaseModel):
     transaction_id: str
-    balance: int
+    status: str
 
 
 class UserViewResponse(BaseModel):
     user_id: str
-    balance: int
+    balance: int | None
     transactions: List[Dict[str, Any]]
 
 
 class AccountsResponse(BaseModel):
-    balances: Dict[str, int]
+    balances: Dict[str, int] | None
 
 
 # --- Metrics ---
@@ -97,26 +121,49 @@ async def _timed(name: str, coro):
 
 
 # --- Logging service failover helpers ---
-async def _logging_request(
-    client: httpx.AsyncClient, method: str, path: str, **kwargs
+async def _get_service_urls(
+    client: httpx.AsyncClient,
+    service_name: str,
+) -> List[str]:
+    try:
+        resp = await client.get(f"{CONFIG_SERVER_URL}/services/{service_name}")
+        resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=503, detail=f"config-server unavailable: {exc!s}")
+
+    urls = [url.rstrip("/") for url in resp.json().get("urls", []) if url]
+    if not urls:
+        raise HTTPException(status_code=503, detail=f"no instances registered for {service_name}")
+    return urls
+
+
+async def _service_request(
+    client: httpx.AsyncClient,
+    service_name: str,
+    method: str,
+    path: str,
+    **kwargs,
 ) -> httpx.Response:
-    """Send request to a randomly chosen logging-service; failover on error."""
-    urls = random.sample(LOGGING_URLS, k=len(LOGGING_URLS))
+    urls = await _get_service_urls(client, service_name)
+    urls = random.sample(urls, k=len(urls))
     last_err: httpx.RequestError | None = None
     for url in urls:
         try:
             return await client.request(method, f"{url}{path}", **kwargs)
         except httpx.RequestError as exc:
             last_err = exc
-    if last_err is None:
-        raise RuntimeError("no logging-service URLs configured")
-    raise last_err
+    raise HTTPException(
+        status_code=503,
+        detail=f"{service_name} unavailable: {last_err!s}" if last_err else f"{service_name} unavailable",
+    )
 
 
 # --- Endpoints ---
-@app.post("/transaction", response_model=FacadePostResponse)
+@app.post("/transaction", response_model=FacadePostResponse, status_code=202)
 async def post_transaction(
-    req: ClientTransactionIn, client: httpx.AsyncClient = Depends(get_client)
+    req: ClientTransactionIn,
+    request: Request,
+    client: httpx.AsyncClient = Depends(get_client),
 ) -> FacadePostResponse:
     tx = {
         "transaction_id": str(uuid.uuid4()),
@@ -124,41 +171,54 @@ async def post_transaction(
         "amount": req.amount,
     }
     try:
-        log_resp, counter_resp = await asyncio.gather(
-            _timed("logging", _logging_request(client, "POST", "/transactions", json=tx)),
-            _timed("counter", client.post(f"{COUNTER_URL}/apply", json={"user_id": req.user_id, "amount": req.amount})),
+        log_resp = await _timed(
+            "logging",
+            _service_request(client, "logging-service", "POST", "/transactions", json=tx),
         )
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=503, detail=f"downstream unavailable: {e!s}")
+        if log_resp.status_code >= 400:
+            raise HTTPException(status_code=502, detail=f"logging-service error: {log_resp.text}")
+        await _timed(
+            "counter",
+            asyncio.to_thread(request.app.state.counter_queue.put, json.dumps(tx)),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"message queue unavailable: {exc!s}")
 
-    if log_resp.status_code >= 400:
-        raise HTTPException(status_code=502, detail=f"logging-service error: {log_resp.text}")
-    if counter_resp.status_code >= 400:
-        raise HTTPException(status_code=502, detail=f"counter-service error: {counter_resp.text}")
-
-    return FacadePostResponse(
-        transaction_id=tx["transaction_id"], balance=int(counter_resp.json()["balance"])
-    )
+    return FacadePostResponse(transaction_id=tx["transaction_id"], status="queued")
 
 
 @app.get("/user/{user_id}", response_model=UserViewResponse)
 async def get_user_view(
     user_id: str, client: httpx.AsyncClient = Depends(get_client)
 ) -> UserViewResponse:
-    try:
-        bal_resp, txs_resp = await asyncio.gather(
-            _timed("counter", client.get(f"{COUNTER_URL}/balance/{user_id}")),
-            _timed("logging", _logging_request(client, "GET", f"/transactions/user/{user_id}")),
-        )
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=503, detail=f"downstream unavailable: {e!s}")
+    balance: int | None = None
 
-    if bal_resp.status_code >= 400 or txs_resp.status_code >= 400:
-        raise HTTPException(status_code=502, detail="Downstream service error")
+    txs_resp = await _timed(
+        "logging",
+        _service_request(client, "logging-service", "GET", f"/transactions/user/{user_id}"),
+    )
+    try:
+        bal_resp = await _timed(
+            "counter",
+            _service_request(client, "counter-service", "GET", f"/balance/{user_id}"),
+        )
+    except HTTPException as exc:
+        if exc.status_code != 503:
+            raise
+        bal_resp = None
+
+    if txs_resp.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"logging-service error: {txs_resp.text}")
+    if bal_resp is not None:
+        if bal_resp.status_code >= 400:
+            raise HTTPException(status_code=502, detail=f"counter-service error: {bal_resp.text}")
+        balance = int(bal_resp.json()["balance"])
 
     return UserViewResponse(
         user_id=user_id,
-        balance=int(bal_resp.json()["balance"]),
+        balance=balance,
         transactions=txs_resp.json().get("transactions", []),
     )
 
@@ -168,9 +228,14 @@ async def get_accounts(
     client: httpx.AsyncClient = Depends(get_client),
 ) -> AccountsResponse:
     try:
-        resp = await _timed("counter", client.get(f"{COUNTER_URL}/balances"))
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=503, detail=f"downstream unavailable: {e!s}")
+        resp = await _timed(
+            "counter",
+            _service_request(client, "counter-service", "GET", "/balances"),
+        )
+    except HTTPException as exc:
+        if exc.status_code == 503:
+            return AccountsResponse(balances=None)
+        raise
 
     if resp.status_code >= 400:
         raise HTTPException(status_code=502, detail=f"counter-service error: {resp.text}")
@@ -194,26 +259,23 @@ async def reset_metrics() -> Dict[str, Any]:
 
 
 @app.post("/reset")
-async def reset_state(client: httpx.AsyncClient = Depends(get_client)) -> Dict[str, Any]:
-    """Reset counter-service DB and clear logging-service Hazelcast map."""
-    results = await asyncio.gather(
-        client.post(f"{COUNTER_URL}/reset"),
-        *[client.post(f"{u}/reset") for u in LOGGING_URLS],
+async def reset_state(
+    request: Request,
+    client: httpx.AsyncClient = Depends(get_client),
+) -> Dict[str, Any]:
+    await asyncio.to_thread(request.app.state.counter_queue.clear)
+
+    counter_resp = await _service_request(client, "counter-service", "POST", "/reset")
+    if counter_resp.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"counter reset failed: {counter_resp.text}")
+
+    logging_urls = await _get_service_urls(client, "logging-service")
+    log_results = await asyncio.gather(
+        *[client.post(f"{u}/reset") for u in logging_urls],
         return_exceptions=True,
     )
-    counter_result, log_results = results[0], results[1:]
-
-    if isinstance(counter_result, httpx.RequestError):
-        raise HTTPException(status_code=503, detail=f"downstream unavailable: {counter_result!s}")
-    if isinstance(counter_result, Exception):
-        raise counter_result
-    if counter_result.status_code >= 400:
-        raise HTTPException(status_code=502, detail=f"counter reset failed: {counter_result.text}")
-
-    logging_ok = any(
-        not isinstance(r, Exception) and r.status_code < 400 for r in log_results
-    )
+    logging_ok = any(not isinstance(r, Exception) and r.status_code < 400 for r in log_results)
     if not logging_ok:
         raise HTTPException(status_code=502, detail="logging reset failed on all instances")
 
-    return {"counter": True, "logging": True}
+    return {"counter": True, "logging": True, "queue": True}

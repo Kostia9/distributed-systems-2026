@@ -6,10 +6,14 @@ from contextlib import asynccontextmanager
 from typing import Dict, List
 
 import hazelcast
+import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-HZ_ADDRESSES = os.getenv("HZ_ADDRESSES", "localhost:5701").split(",")
+HZ_ADDRESSES = [addr.strip() for addr in os.getenv("HZ_ADDRESSES", "localhost:5701").split(",") if addr.strip()]
+CONFIG_SERVER_URL = os.getenv("CONFIG_SERVER_URL", "http://localhost:8003").rstrip("/")
+SERVICE_URL = os.getenv("SERVICE_URL", "http://localhost:8001").rstrip("/")
+SERVICE_NAME = "logging-service"
 MAP_NAME = "transactions"
 
 logging.basicConfig(
@@ -20,6 +24,20 @@ logging.basicConfig(
 logger = logging.getLogger("logging-service")
 
 
+async def _register_service() -> None:
+    payload = {"service_name": SERVICE_NAME, "url": SERVICE_URL}
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.post(f"{CONFIG_SERVER_URL}/register", json=payload)
+                resp.raise_for_status()
+            logger.info("Registered %s at %s", SERVICE_NAME, SERVICE_URL)
+            return
+        except httpx.HTTPError as exc:
+            logger.warning("config-server unavailable, retrying registration: %s", exc)
+            await asyncio.sleep(1)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     client = hazelcast.HazelcastClient(
@@ -28,6 +46,7 @@ async def lifespan(app: FastAPI):
     )
     app.state.hz_client = client
     app.state.tx_map = client.get_map(MAP_NAME).blocking()
+    await _register_service()
     logger.info("Connected to Hazelcast cluster, members: %s", HZ_ADDRESSES)
     yield
     client.shutdown()
@@ -51,7 +70,13 @@ async def add_transaction(tx: Transaction) -> Transaction:
     tx_map = app.state.tx_map
     payload = tx.model_dump_json()
     await asyncio.to_thread(tx_map.put, tx.transaction_id, payload)
-    logger.info("Stored transaction %s (user=%s, amount=%d)", tx.transaction_id, tx.user_id, tx.amount)
+    logger.info(
+        "service=%s stored transaction %s (user=%s, amount=%d)",
+        SERVICE_URL,
+        tx.transaction_id,
+        tx.user_id,
+        tx.amount,
+    )
     return tx
 
 
