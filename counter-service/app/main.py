@@ -3,19 +3,25 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager, suppress
-from typing import Dict
+from dataclasses import dataclass
+from time import perf_counter
 
 import asyncpg
-import hazelcast
 import httpx
 from fastapi import FastAPI
 from pydantic import BaseModel
+
+import hazelcast
 
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
     "postgresql://counter:counter@localhost:5432/counter",
 )
-HZ_ADDRESSES = [addr.strip() for addr in os.getenv("HZ_ADDRESSES", "localhost:5701").split(",") if addr.strip()]
+HZ_ADDRESSES = [
+    addr.strip()
+    for addr in os.getenv("HZ_ADDRESSES", "localhost:5701").split(",")
+    if addr.strip()
+]
 CONFIG_SERVER_URL = os.getenv("CONFIG_SERVER_URL", "http://localhost:8003").rstrip("/")
 SERVICE_URL = os.getenv("SERVICE_URL", "http://localhost:8002").rstrip("/")
 SERVICE_NAME = "counter-service"
@@ -27,6 +33,33 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("counter-service")
+
+
+@dataclass
+class Timing:
+    total_s: float = 0.0
+    count: int = 0
+
+    def add(self, dt_s: float) -> None:
+        self.total_s += dt_s
+        self.count += 1
+
+    def snapshot(self) -> dict[str, float | int]:
+        avg_ms = (self.total_s / self.count * 1000.0) if self.count else 0.0
+        return {"count": self.count, "total_s": self.total_s, "avg_ms": avg_ms}
+
+
+_TIMINGS: dict[str, Timing] = {
+    "db_apply": Timing(),
+}
+
+
+async def _timed(name: str, coro):
+    t0 = perf_counter()
+    try:
+        return await coro
+    finally:
+        _TIMINGS[name].add(perf_counter() - t0)
 
 
 async def _register_service() -> None:
@@ -72,9 +105,11 @@ async def _consume_transactions(app: FastAPI) -> None:
         if payload is None:
             continue
         try:
-            await _apply_transaction(app.state.db, payload)
+            await _timed("db_apply", _apply_transaction(app.state.db, payload))
         except Exception:
-            logger.exception("Failed to apply queued transaction, returning it to the queue")
+            logger.exception(
+                "Failed to apply queued transaction, returning it to the queue"
+            )
             await asyncio.to_thread(queue.put, payload)
             await asyncio.sleep(1)
 
@@ -117,7 +152,18 @@ class BalanceResponse(BaseModel):
 
 
 class BalancesResponse(BaseModel):
-    balances: Dict[str, int]
+    balances: dict[str, int]
+
+
+@app.get("/metrics")
+async def get_metrics() -> dict[str, dict[str, float | int]]:
+    return {"db_apply": _TIMINGS["db_apply"].snapshot()}
+
+
+@app.post("/metrics/reset")
+async def reset_metrics() -> dict[str, bool]:
+    _TIMINGS["db_apply"] = Timing()
+    return {"ok": True}
 
 
 @app.get("/balance/{user_id}", response_model=BalanceResponse)
@@ -137,7 +183,7 @@ async def get_all_balances() -> BalancesResponse:
 
 
 @app.post("/reset")
-async def reset() -> Dict[str, bool]:
+async def reset() -> dict[str, bool]:
     async with app.state.db.acquire() as conn:
         await conn.execute("TRUNCATE balances")
     return {"ok": True}

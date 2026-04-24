@@ -3,14 +3,18 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
-from typing import Dict, List
 
-import hazelcast
 import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-HZ_ADDRESSES = [addr.strip() for addr in os.getenv("HZ_ADDRESSES", "localhost:5701").split(",") if addr.strip()]
+import hazelcast
+
+HZ_ADDRESSES = [
+    addr.strip()
+    for addr in os.getenv("HZ_ADDRESSES", "localhost:5701").split(",")
+    if addr.strip()
+]
 CONFIG_SERVER_URL = os.getenv("CONFIG_SERVER_URL", "http://localhost:8003").rstrip("/")
 SERVICE_URL = os.getenv("SERVICE_URL", "http://localhost:8001").rstrip("/")
 SERVICE_NAME = "logging-service"
@@ -62,7 +66,7 @@ class Transaction(BaseModel):
 
 
 class TransactionList(BaseModel):
-    transactions: List[Transaction]
+    transactions: list[Transaction]
 
 
 @app.post("/transactions", response_model=Transaction)
@@ -110,7 +114,7 @@ async def get_transaction(transaction_id: str) -> Transaction:
 
 
 @app.post("/reset")
-async def reset() -> Dict[str, bool]:
+async def reset() -> dict[str, bool]:
     tx_map = app.state.tx_map
     await asyncio.to_thread(tx_map.clear)
     logger.info("Cleared Hazelcast map %s", MAP_NAME)
