@@ -101,7 +101,12 @@ async def _apply_transaction(pool: asyncpg.Pool, payload: str) -> None:
 async def _consume_transactions(app: FastAPI) -> None:
     queue = app.state.tx_queue
     while True:
-        payload = await asyncio.to_thread(queue.poll, 1.0)
+        try:
+            payload = await asyncio.to_thread(queue.poll, 1.0)
+        except Exception:
+            logger.exception("Failed to poll transaction queue, retrying")
+            await asyncio.sleep(1)
+            continue
         if payload is None:
             continue
         try:
