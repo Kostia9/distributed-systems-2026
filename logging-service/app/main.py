@@ -42,6 +42,30 @@ async def _register_service() -> None:
             await asyncio.sleep(1)
 
 
+async def _await_hz(hz_future):
+    loop = asyncio.get_running_loop()
+    aio_future = loop.create_future()
+
+    def _set_result(value):
+        if not aio_future.done():
+            aio_future.set_result(value)
+
+    def _set_exception(exc):
+        if not aio_future.done():
+            aio_future.set_exception(exc)
+
+    def _on_done(f):
+        try:
+            result = f.result()
+        except BaseException as exc:
+            loop.call_soon_threadsafe(_set_exception, exc)
+        else:
+            loop.call_soon_threadsafe(_set_result, result)
+
+    hz_future.add_done_callback(_on_done)
+    return await aio_future
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     client = hazelcast.HazelcastClient(
@@ -49,7 +73,7 @@ async def lifespan(app: FastAPI):
         cluster_name="dev",
     )
     app.state.hz_client = client
-    app.state.tx_map = client.get_map(MAP_NAME).blocking()
+    app.state.tx_map = client.get_map(MAP_NAME)
     await _register_service()
     logger.info("Connected to Hazelcast cluster, members: %s", HZ_ADDRESSES)
     yield
@@ -73,7 +97,7 @@ class TransactionList(BaseModel):
 async def add_transaction(tx: Transaction) -> Transaction:
     tx_map = app.state.tx_map
     payload = tx.model_dump_json()
-    await asyncio.to_thread(tx_map.put, tx.transaction_id, payload)
+    await _await_hz(tx_map.put(tx.transaction_id, payload))
     logger.info(
         "service=%s stored transaction %s (user=%s, amount=%d)",
         SERVICE_URL,
@@ -87,7 +111,7 @@ async def add_transaction(tx: Transaction) -> Transaction:
 @app.get("/transactions", response_model=TransactionList)
 async def get_all_transactions() -> TransactionList:
     tx_map = app.state.tx_map
-    raw_values = await asyncio.to_thread(tx_map.values)
+    raw_values = await _await_hz(tx_map.values())
     items = [Transaction(**json.loads(v)) for v in raw_values]
     return TransactionList(transactions=items)
 
@@ -95,7 +119,7 @@ async def get_all_transactions() -> TransactionList:
 @app.get("/transactions/user/{user_id}", response_model=TransactionList)
 async def get_user_transactions(user_id: str) -> TransactionList:
     tx_map = app.state.tx_map
-    raw_values = await asyncio.to_thread(tx_map.values)
+    raw_values = await _await_hz(tx_map.values())
     items = [
         Transaction(**d)
         for d in (json.loads(v) for v in raw_values)
@@ -107,7 +131,7 @@ async def get_user_transactions(user_id: str) -> TransactionList:
 @app.get("/transactions/{transaction_id}", response_model=Transaction)
 async def get_transaction(transaction_id: str) -> Transaction:
     tx_map = app.state.tx_map
-    raw = await asyncio.to_thread(tx_map.get, transaction_id)
+    raw = await _await_hz(tx_map.get(transaction_id))
     if raw is None:
         raise HTTPException(status_code=404, detail="transaction not found")
     return Transaction(**json.loads(raw))
@@ -116,6 +140,6 @@ async def get_transaction(transaction_id: str) -> Transaction:
 @app.post("/reset")
 async def reset() -> dict[str, bool]:
     tx_map = app.state.tx_map
-    await asyncio.to_thread(tx_map.clear)
+    await _await_hz(tx_map.clear())
     logger.info("Cleared Hazelcast map %s", MAP_NAME)
     return {"ok": True}
