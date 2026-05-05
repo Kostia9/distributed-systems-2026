@@ -1,3 +1,8 @@
+#!/usr/bin/env python3
+# /// script
+# dependencies = ["httpx>=0.26"]
+# ///
+
 import argparse
 import asyncio
 from time import perf_counter

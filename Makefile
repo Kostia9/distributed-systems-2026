@@ -123,10 +123,10 @@ smoke:
 	if [ "$$balance" = "120" ]; then echo "balance=120 OK"; else echo "FAIL: expected balance=120, got $$balance"; exit 1; fi
 
 perf:
-	uv run python client/perf_test.py --base-url http://localhost:$(FACADE_PORT) --scenario 1 --clients 10 --n 1000
+	uv run client/perf_test.py --base-url http://localhost:$(FACADE_PORT) --scenario 1 --clients 10 --n 1000
 
 perf2:
-	uv run python client/perf_test.py --base-url http://localhost:$(FACADE_PORT) --scenario 2 --clients 10 --n 1000
+	uv run client/perf_test.py --base-url http://localhost:$(FACADE_PORT) --scenario 2 --clients 10 --n 1000
 
 minikube-start:
 	minikube start
