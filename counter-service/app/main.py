@@ -7,25 +7,12 @@ from dataclasses import dataclass
 from time import perf_counter
 
 import asyncpg
-import httpx
 from fastapi import FastAPI
 from pydantic import BaseModel
 
 import hazelcast
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql://counter:counter@localhost:5432/counter",
-)
-HZ_ADDRESSES = [
-    addr.strip()
-    for addr in os.getenv("HZ_ADDRESSES", "localhost:5701").split(",")
-    if addr.strip()
-]
-CONFIG_SERVER_URL = os.getenv("CONFIG_SERVER_URL", "http://localhost:8003").rstrip("/")
-SERVICE_URL = os.getenv("SERVICE_URL", "http://localhost:8002").rstrip("/")
 SERVICE_NAME = "counter-service"
-QUEUE_NAME = os.getenv("COUNTER_QUEUE_NAME", "counter-transactions")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,6 +20,26 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("counter-service")
+
+
+def _required_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"{name} environment variable is required")
+    return value
+
+
+def _required_csv_env(name: str) -> list[str]:
+    values = [item.strip() for item in _required_env(name).split(",") if item.strip()]
+    if not values:
+        raise RuntimeError(f"{name} environment variable must not be empty")
+    return values
+
+
+DATABASE_URL = _required_env("DATABASE_URL")
+HZ_ADDRESSES = _required_csv_env("HZ_ADDRESSES")
+HZ_CLUSTER_NAME = _required_env("HZ_CLUSTER_NAME")
+QUEUE_NAME = _required_env("COUNTER_QUEUE_NAME")
 
 
 @dataclass
@@ -60,20 +67,6 @@ async def _timed(name: str, coro):
         return await coro
     finally:
         _TIMINGS[name].add(perf_counter() - t0)
-
-
-async def _register_service() -> None:
-    payload = {"service_name": SERVICE_NAME, "url": SERVICE_URL}
-    while True:
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.post(f"{CONFIG_SERVER_URL}/register", json=payload)
-                resp.raise_for_status()
-            logger.info("Registered %s at %s", SERVICE_NAME, SERVICE_URL)
-            return
-        except httpx.HTTPError as exc:
-            logger.warning("config-server unavailable, retrying registration: %s", exc)
-            await asyncio.sleep(1)
 
 
 async def _apply_transaction(pool: asyncpg.Pool, payload: str) -> None:
@@ -133,12 +126,11 @@ async def lifespan(app: FastAPI):
         )
     hz_client = hazelcast.HazelcastClient(
         cluster_members=HZ_ADDRESSES,
-        cluster_name="dev",
+        cluster_name=HZ_CLUSTER_NAME,
     )
     app.state.db = pool
     app.state.hz_client = hz_client
     app.state.tx_queue = hz_client.get_queue(QUEUE_NAME).blocking()
-    await _register_service()
     app.state.consumer_task = asyncio.create_task(_consume_transactions(app))
     yield
     app.state.consumer_task.cancel()
@@ -158,6 +150,11 @@ class BalanceResponse(BaseModel):
 
 class BalancesResponse(BaseModel):
     balances: dict[str, int]
+
+
+@app.get("/health")
+async def health() -> dict[str, str]:
+    return {"status": "ok", "service": SERVICE_NAME}
 
 
 @app.get("/metrics")

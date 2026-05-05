@@ -1,7 +1,6 @@
 import argparse
 import asyncio
 from time import perf_counter
-from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
@@ -9,14 +8,6 @@ import httpx
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Perf test client for facade-service")
     p.add_argument("--base-url", default="http://localhost:8000", help="Facade URL")
-    p.add_argument(
-        "--counter-url",
-        default=None,
-        help=(
-            "Counter-service URL for reading counter metrics "
-            "(default: base-url host on port 8002)"
-        ),
-    )
     p.add_argument("--scenario", choices=["1", "2"], default="1")
     p.add_argument("--clients", type=int, default=10)
     p.add_argument("--n", type=int, default=10_000, help="requests per client")
@@ -33,19 +24,6 @@ def parse_args() -> argparse.Namespace:
         help="seconds between balance polls",
     )
     return p.parse_args()
-
-
-def derive_counter_url(base_url: str, counter_url: str | None) -> str:
-    if counter_url:
-        return counter_url.rstrip("/")
-
-    parts = urlsplit(base_url)
-    hostname = parts.hostname or "localhost"
-    port = parts.port
-    netloc = (
-        f"{hostname}:8002" if port is None else parts.netloc.rsplit(":", 1)[0] + ":8002"
-    )
-    return urlunsplit((parts.scheme, netloc, "", "", "")).rstrip("/")
 
 
 async def worker(
@@ -106,7 +84,6 @@ async def wait_for_expected_balances(
 async def main() -> None:
     args = parse_args()
     base_url = args.base_url.rstrip("/")
-    counter_url = derive_counter_url(base_url, args.counter_url)
     amount = 1  # money per transaction
 
     users: list[str]
@@ -121,11 +98,6 @@ async def main() -> None:
     timeout = httpx.Timeout(30.0)
 
     async with httpx.AsyncClient(limits=limits, timeout=timeout) as client:
-        # reset timings
-        await client.post(f"{base_url}/metrics/reset")
-        await client.post(f"{counter_url}/metrics/reset")
-
-        # snapshot balances before the test
         before = (await client.get(f"{base_url}/accounts")).json()
         balances_before = before.get("balances") or {}
         expected_balances = build_expected_balances(
@@ -136,6 +108,8 @@ async def main() -> None:
             balances_before,
         )
 
+        await client.post(f"{base_url}/metrics/reset/all")
+
         t0 = perf_counter()
         await asyncio.gather(
             *[
@@ -144,6 +118,7 @@ async def main() -> None:
             ]
         )
         dt = perf_counter() - t0
+        post_metrics = (await client.get(f"{base_url}/metrics/all")).json()
 
         total = args.clients * args.n
         rps = total / dt if dt > 0 else float("inf")
@@ -154,9 +129,6 @@ async def main() -> None:
         )
         print(f"post_time_s={dt:.3f}  post_rps={rps:.1f}")
 
-        facade_metrics = (await client.get(f"{base_url}/metrics")).json()
-        print("facade_metrics (logging-http, counter-queue.put):", facade_metrics)
-
         accounts, ok, settle_time = await wait_for_expected_balances(
             client,
             base_url,
@@ -165,10 +137,25 @@ async def main() -> None:
             args.poll_interval,
         )
         balances_after = accounts.get("balances") or {}
+        total_time = dt + settle_time
         print(f"settle_time_s={settle_time:.3f}")
+        print(f"total_time_s={total_time:.3f}")
         print("accounts:", accounts)
 
-        counter_metrics = (await client.get(f"{counter_url}/metrics")).json()
+        metrics = (await client.get(f"{base_url}/metrics/all")).json()
+        facade_metrics = post_metrics.get("facade") or {}
+        counter_metrics = metrics.get("counter") or {}
+        logging_contribution = (
+            facade_metrics.get("logging", {}).get("total_s", 0.0)
+        )
+        counter_contribution = (
+            facade_metrics.get("counter", {}).get("total_s", 0.0)
+            + counter_metrics.get("db_apply", {}).get("total_s", 0.0)
+        )
+
+        print(f"logging_service_contribution_s={logging_contribution:.3f}")
+        print(f"counter_service_contribution_s={counter_contribution:.3f}")
+        print("facade_metrics (logging-http, counter-queue.put):", facade_metrics)
         print("counter_metrics (db-apply):", counter_metrics)
 
         print(

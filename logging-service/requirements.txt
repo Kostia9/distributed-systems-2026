@@ -1,4 +1,3 @@
 fastapi>=0.110
 uvicorn[standard]>=0.24
-httpx>=0.26
 hazelcast-python-client>=5.4

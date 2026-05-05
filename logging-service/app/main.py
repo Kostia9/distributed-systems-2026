@@ -4,19 +4,11 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
-import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 import hazelcast
 
-HZ_ADDRESSES = [
-    addr.strip()
-    for addr in os.getenv("HZ_ADDRESSES", "localhost:5701").split(",")
-    if addr.strip()
-]
-CONFIG_SERVER_URL = os.getenv("CONFIG_SERVER_URL", "http://localhost:8003").rstrip("/")
-SERVICE_URL = os.getenv("SERVICE_URL", "http://localhost:8001").rstrip("/")
 SERVICE_NAME = "logging-service"
 MAP_NAME = "transactions"
 
@@ -28,18 +20,23 @@ logging.basicConfig(
 logger = logging.getLogger("logging-service")
 
 
-async def _register_service() -> None:
-    payload = {"service_name": SERVICE_NAME, "url": SERVICE_URL}
-    while True:
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.post(f"{CONFIG_SERVER_URL}/register", json=payload)
-                resp.raise_for_status()
-            logger.info("Registered %s at %s", SERVICE_NAME, SERVICE_URL)
-            return
-        except httpx.HTTPError as exc:
-            logger.warning("config-server unavailable, retrying registration: %s", exc)
-            await asyncio.sleep(1)
+def _required_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"{name} environment variable is required")
+    return value
+
+
+def _required_csv_env(name: str) -> list[str]:
+    values = [item.strip() for item in _required_env(name).split(",") if item.strip()]
+    if not values:
+        raise RuntimeError(f"{name} environment variable must not be empty")
+    return values
+
+
+HZ_ADDRESSES = _required_csv_env("HZ_ADDRESSES")
+HZ_CLUSTER_NAME = _required_env("HZ_CLUSTER_NAME")
+INSTANCE_ID = os.getenv("HOSTNAME", SERVICE_NAME)
 
 
 async def _await_hz(hz_future):
@@ -70,11 +67,10 @@ async def _await_hz(hz_future):
 async def lifespan(app: FastAPI):
     client = hazelcast.HazelcastClient(
         cluster_members=HZ_ADDRESSES,
-        cluster_name="dev",
+        cluster_name=HZ_CLUSTER_NAME,
     )
     app.state.hz_client = client
     app.state.tx_map = client.get_map(MAP_NAME)
-    await _register_service()
     logger.info("Connected to Hazelcast cluster, members: %s", HZ_ADDRESSES)
     yield
     client.shutdown()
@@ -93,14 +89,19 @@ class TransactionList(BaseModel):
     transactions: list[Transaction]
 
 
+@app.get("/health")
+async def health() -> dict[str, str]:
+    return {"status": "ok", "service": SERVICE_NAME}
+
+
 @app.post("/transactions", response_model=Transaction)
 async def add_transaction(tx: Transaction) -> Transaction:
     tx_map = app.state.tx_map
     payload = tx.model_dump_json()
     await _await_hz(tx_map.put(tx.transaction_id, payload))
     logger.info(
-        "service=%s stored transaction %s (user=%s, amount=%d)",
-        SERVICE_URL,
+        "instance=%s stored transaction %s (user=%s, amount=%d)",
+        INSTANCE_ID,
         tx.transaction_id,
         tx.user_id,
         tx.amount,
