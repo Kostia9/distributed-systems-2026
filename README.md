@@ -63,7 +63,8 @@ Underneath, `make up` runs:
 
 1. `eval $(minikube docker-env)` and `docker build -t distributed-<svc>:latest ./<svc>` for the three microservices.
 2. `kubectl apply -f k8s/{app-config,postgres,hazelcast,microservices}.yaml`.
-3. `kubectl rollout status` for hazelcast StatefulSet and three Deployments.
+3. `kubectl rollout status` for the Hazelcast StatefulSet, PostgreSQL, and
+   the three microservice Deployments.
 
 Inspect registered instances and service endpoints (Kubernetes-native discovery):
 
@@ -90,7 +91,8 @@ curl http://localhost:8000/accounts
 
 ## Scale and failover demo
 
-`make up` starts `logging-service` with 3 replicas; `facade-service` and `counter-service` run as a single replica each for clean perf metrics.
+The current Kubernetes manifests start `logging-service` with 3 replicas,
+`facade-service` with 1 replica, and `counter-service` with 1 replica.
 
 ```bash
 kubectl get pods -l app=logging-service
@@ -119,13 +121,4 @@ for i in $(seq 1 5); do
 done
 
 curl http://localhost:8000/user/u2
-```
-
-## Local Docker Compose
-
-Docker Compose remains available for quick local smoke tests:
-
-```bash
-docker compose up --build -d
-curl http://localhost:8000/health
 ```
