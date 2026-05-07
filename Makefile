@@ -81,16 +81,16 @@ pods:
 	kubectl get pods -w
 
 logs:
-	kubectl logs -l 'app in (facade-service,counter-service,logging-service)' --tail=100 -f
+	kubectl logs -l 'app in (facade-service,counter-service,logging-service)' --tail=100 -f | grep --line-buffered -v '"GET /health'
 
 logs-facade:
-	kubectl logs -l app=facade-service --tail=100 -f
+	kubectl logs -l app=facade-service --tail=100 -f | grep --line-buffered -v '"GET /health'
 
 logs-counter:
-	kubectl logs -l app=counter-service --tail=100 -f
+	kubectl logs -l app=counter-service --tail=100 -f | grep --line-buffered -v '"GET /health'
 
 logs-logging:
-	kubectl logs -l app=logging-service --tail=100 -f
+	kubectl logs -l app=logging-service --tail=100 -f | grep --line-buffered -v '"GET /health'
 
 logs-hz:
 	kubectl logs hazelcast-0 --tail=100 -f

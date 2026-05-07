@@ -11,6 +11,8 @@ import hazelcast
 
 SERVICE_NAME = "logging-service"
 MAP_NAME = "transactions"
+INT64_MIN = -(2**63)
+INT64_MAX = 2**63 - 1
 
 logging.basicConfig(
     level=logging.INFO,
@@ -82,7 +84,7 @@ app = FastAPI(title="logging-service", lifespan=lifespan)
 class Transaction(BaseModel):
     transaction_id: str = Field(..., min_length=1)
     user_id: str = Field(..., min_length=1)
-    amount: int
+    amount: int = Field(..., ge=INT64_MIN, le=INT64_MAX)
 
 
 class TransactionList(BaseModel):

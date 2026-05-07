@@ -16,6 +16,8 @@ import hazelcast
 
 SERVICE_NAME = "facade-service"
 HTTP_TIMEOUT_S = float(os.getenv("HTTP_TIMEOUT_S", "5"))
+INT64_MIN = -(2**63)
+INT64_MAX = 2**63 - 1
 
 logging.basicConfig(
     level=logging.INFO,
@@ -85,7 +87,7 @@ HttpClientDependency = Annotated[httpx.AsyncClient, Depends(get_client)]
 # --- Request models ---
 class ClientTransactionIn(BaseModel):
     user_id: str = Field(..., min_length=1)
-    amount: int
+    amount: int = Field(..., ge=INT64_MIN, le=INT64_MAX)
 
 
 class FacadePostResponse(BaseModel):
