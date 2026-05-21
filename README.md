@@ -19,9 +19,10 @@ Infrastructure:
 Kubernetes responsibilities:
 - Service registration: pods are registered behind Kubernetes Services by label
   selectors.
-- Service discovery: `facade-service` uses Service DNS names from `app-config`.
-- Config server: Hazelcast, queue, and downstream service settings live in
-  `ConfigMap`; PostgreSQL credentials live in `Secret`.
+- Service discovery: `facade-service` uses Kubernetes Service DNS names
+  (`logging-service`, `counter-service`).
+- Config server: Hazelcast and queue settings live in `ConfigMap`; PostgreSQL
+  credentials live in `Secret`.
 - Failover: Services route calls only to ready pods, and endpoints change when
   pods are deleted or become unavailable.
 

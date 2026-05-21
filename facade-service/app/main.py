@@ -45,8 +45,8 @@ HZ_ADDRESSES = _required_csv_env("HZ_ADDRESSES")
 HZ_CLUSTER_NAME = _required_env("HZ_CLUSTER_NAME")
 QUEUE_NAME = _required_env("COUNTER_QUEUE_NAME")
 SERVICE_URLS = {
-    "logging-service": _required_env("LOGGING_SERVICE_URL").rstrip("/"),
-    "counter-service": _required_env("COUNTER_SERVICE_URL").rstrip("/"),
+    "logging-service": "http://logging-service:8001",
+    "counter-service": "http://counter-service:8002",
 }
 
 

@@ -6,8 +6,6 @@ data:
   HZ_ADDRESSES: "hazelcast-client:5701"
   HZ_CLUSTER_NAME: "dev"
   COUNTER_QUEUE_NAME: "counter-transactions"
-  LOGGING_SERVICE_URL: "http://logging-service:8001"
-  COUNTER_SERVICE_URL: "http://counter-service:8002"
   HTTP_TIMEOUT_S: "5"
 ---
 apiVersion: v1
